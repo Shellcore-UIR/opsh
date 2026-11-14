@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""opsh — mini-shell en Python (projet Systèmes d'Exploitation, UIR/ESIN).
+
+Fonctionnalités :
+  * REPL avec prompt « opsh> », historique et complétion (readline)
+  * builtins renommés : go, list, show, path, say, copy, move, del, newdir,
+    newfile, info, past, quit + osinfo, export, unset, test, jobs
+  * redirections  >  >>  <
+  * pipe ->  (à la place de |), arrière-plan &, signaux SIGINT / SIGCHLD
+  * variables : $VAR ${VAR} $? $! $$ $1.. ; export ; VAR=valeur
+  * substitution $(...) et `...`
+  * fichier ~/.opshrc au démarrage
+  * mode script : opsh script.opsh  (if / else / fi, for / done, while / done)
+"""
+import os
+import re
+import sys
+import glob
+import time
+import shutil
+import signal
+import stat
+
+try:
+    import readline
+except ImportError:  # Windows : pas de readline
+    readline = None
+
+# --------------------------------------------------------------------------
+# État global du shell
+# --------------------------------------------------------------------------
+shvars = {}          # variables du shell (non exportées)
+last_status = 0      # $?
+last_bg = ""         # $!
+bg_jobs = {}         # pid -> ligne de commande (processus en arrière-plan)
+HISTFILE = os.path.expanduser("~/.opsh_history")
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+# --------------------------------------------------------------------------
+# Variables et substitution de commandes
+# --------------------------------------------------------------------------
+def get_var(name):
+    """Valeur d'une variable : spéciales d'abord, puis shell, puis environnement."""
+    if name == "?":
+        return str(last_status)
+    if name == "!":
+        return str(last_bg)
+    if name == "$":
+        return str(os.getpid())
+    if name in shvars:
+        return shvars[name]
+    return os.environ.get(name, "")
+
+
+def set_var(name, value):
+    shvars[name] = value
+    if name in os.environ:           # une variable exportée reste synchronisée
+        os.environ[name] = value
+
+
+def capture(cmdline):
+    """Exécute cmdline dans un fils (fork) et renvoie sa sortie standard.
+    Le fils redirige fd 1 vers un pipe que le père lit : c'est de l'IPC."""
+    sys.stdout.flush()
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        os.dup2(w, 1)
+        os.close(w)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        try:
+            st = execute_line(cmdline)
+        except SystemExit as e:
+            st = e.code if isinstance(e.code, int) else 0
+        sys.stdout.flush()
+        os._exit(st & 0xFF)
+    os.close(w)
+    data = b""
+    while True:
+        chunk = os.read(r, 4096)
+        if not chunk:
+            break
+        data += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    return data.decode(errors="replace").rstrip("\n")
+
+
+def expand_dollar(s, i):
+    """s[i] == '$'. Renvoie (texte_développé, nouvel_index)."""
+    n = len(s)
+    if i + 1 >= n:
+        return "$", i + 1
+    c = s[i + 1]
+    if c == "(":                                   # $( ... )
+        depth, j = 1, i + 2
+        while j < n and depth:
+            depth += (s[j] == "(") - (s[j] == ")")
+            j += 1
+        if depth:
+            raise SyntaxError("parenthèse non fermée dans $(...)")
+        return capture(s[i + 2:j - 1]), j
+    if c == "{":                                   # ${VAR}
+        j = s.find("}", i + 2)
+        if j < 0:
+            raise SyntaxError("accolade non fermée dans ${...}")
+        return get_var(s[i + 2:j]), j + 1
+    if c in "?!$":
+        return get_var(c), i + 2
+    if c.isdigit():
+        return get_var(c), i + 2
+    m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", s[i + 1:])
+    if m:
+        return get_var(m.group()), i + 1 + m.end()
+    return "$", i + 1
+
+
+# --------------------------------------------------------------------------
+# Analyse lexicale : ligne -> liste de ("word", texte) / ("op", opérateur)
+# --------------------------------------------------------------------------
+def tokenize(line):
+    toks, cur, has = [], "", False
+    i, n = 0, len(line)
+
+    def flush():
+        nonlocal cur, has
+        if has:
+            toks.append(("word", cur))
+        cur, has = "", False
+
+    while i < n:
+        c = line[i]
+        if c in " \t":
+            flush(); i += 1
+        elif c == "#" and not has:                  # commentaire
+            break
+        elif line.startswith("->", i):              # notre pipe
+            flush(); toks.append(("op", "->")); i += 2
+        elif line.startswith(">>", i):
+            flush(); toks.append(("op", ">>")); i += 2
+        elif c in "<>&":
+            flush(); toks.append(("op", c)); i += 1
+        elif c == "'":                              # quotes simples : littéral
+            j = line.find("'", i + 1)
+            if j < 0:
+                raise SyntaxError("quote ' non fermée")
+            cur += line[i + 1:j]; has = True; i = j + 1
+        elif c == '"':                              # doubles : expansions permises
+            i += 1; has = True
+            while i < n and line[i] != '"':
+                if line[i] == "$":
+                    t, i = expand_dollar(line, i); cur += t
+                elif line[i] == "`":
+                    j = line.find("`", i + 1)
+                    if j < 0:
+                        raise SyntaxError("backtick non fermé")
+                    cur += capture(line[i + 1:j]); i = j + 1
+                elif line[i] == "\\" and i + 1 < n:
+                    cur += line[i + 1]; i += 2
+                else:
+                    cur += line[i]; i += 1
+            if i >= n:
+                raise SyntaxError('quote " non fermée')
+            i += 1
+        elif c == "$":
+            t, i = expand_dollar(line, i); cur += t; has = True
+        elif c == "`":
+            j = line.find("`", i + 1)
+            if j < 0:
+                raise SyntaxError("backtick non fermé")
+            cur += capture(line[i + 1:j]); has = True; i = j + 1
+        elif c == "\\" and i + 1 < n:
+            cur += line[i + 1]; has = True; i += 2
+        else:
+            cur += c; has = True; i += 1
+    flush()
+    return toks
+
+
+def parse(toks):
+    """Découpe par '->' ; extrait redirections et '&'.
+    Renvoie ([(argv, redirs), ...], background)."""
+    bg = False
+    if toks and toks[-1] == ("op", "&"):
+        bg, toks = True, toks[:-1]
+    segs = [[]]
+    for t in toks:
+        if t == ("op", "->"):
+            segs.append([])
+        else:
+            segs[-1].append(t)
+    cmds = []
+    for seg in segs:
+        argv, redirs, j = [], [], 0
+        while j < len(seg):
+            kind, val = seg[j]
+            if kind == "op" and val in ("<", ">", ">>"):
+                if j + 1 >= len(seg) or seg[j + 1][0] != "word":
+                    raise SyntaxError(f"fichier attendu après {val}")
+                redirs.append((val, seg[j + 1][1])); j += 2
+            elif kind == "op":
+                raise SyntaxError(f"opérateur inattendu « {val} »")
+            else:
+                argv.append(val); j += 1
+        if not argv:
+            raise SyntaxError("commande vide autour de ->")
+        cmds.append((argv, redirs))
+    return cmds, bg
+
+
+# --------------------------------------------------------------------------
+# Builtins (chacun renvoie un code de retour)
+# --------------------------------------------------------------------------
+def err(msg):
+    print(f"opsh: {msg}", file=sys.stderr)
+    return 1
+
+
+def b_go(a):
+    """cd : DOIT être un builtin. chdir() modifie le répertoire courant du
+    processus appelant ; dans un fils forké, le shell parent ne verrait rien."""
+    target = a[1] if len(a) > 1 else os.environ.get("HOME", "/")
+    if target == "-":
+        target = os.environ.get("OLDPWD", os.getcwd())
+    old = os.getcwd()
+    try:
+        os.chdir(target)
+    except OSError as e:
+        return err(f"go: {target}: {e.strerror}")
+    os.environ["OLDPWD"] = old
+    os.environ["PWD"] = os.getcwd()
+    return 0
+
+
+def b_quit(a):
+    code = int(a[1]) if len(a) > 1 and a[1].lstrip("-").isdigit() else last_status
+    raise SystemExit(code)
+
+
+def b_path(a):
+    print(os.getcwd()); return 0
+
+
+def b_say(a):
+    args, nl = a[1:], True
+    if args and args[0] == "-n":
+        args, nl = args[1:], False
+    sys.stdout.write(" ".join(args) + ("\n" if nl else ""))
+    return 0
+
+
+def b_list(a):
+    show_all = long_fmt = False
+    paths = []
+    for x in a[1:]:
+        if x.startswith("-") and len(x) > 1:
+            show_all |= "a" in x
+            long_fmt |= "l" in x
+        else:
+            paths.append(x)
+    paths = paths or ["."]
+    status = 0
+    for p in paths:
+        if len(paths) > 1:
+            print(f"{p}:")
+        try:
+            names = sorted(os.listdir(p)) if os.path.isdir(p) else [p]
+        except OSError as e:
+            status = err(f"list: {p}: {e.strerror}"); continue
+        if show_all:
+            names = [".", ".."] + names
+        else:
+            names = [x for x in names if not x.startswith(".")]
+        if long_fmt:
+            for nm in names:
+                full = nm if p == nm else os.path.join(p, nm)
+                st = os.lstat(full)
+                date = time.strftime("%d %b %H:%M", time.localtime(st.st_mtime))
+                print(f"{stat.filemode(st.st_mode)} {st.st_size:>8} {date} {nm}")
+        else:
+            print("  ".join(names))
+    return status
+
+
+def b_show(a):
+    """cat : sans argument, lit l'entrée standard (utile dans un pipe ->)."""
+    if len(a) == 1:
+        sys.stdout.write(sys.stdin.read()); return 0
+    status = 0
+    for f in a[1:]:
+        try:
+            with open(f, "r", errors="replace") as fh:
+                shutil.copyfileobj(fh, sys.stdout)
+        except OSError as e:
+            status = err(f"show: {f}: {e.strerror}")
+    return status
+
+
+def b_copy(a):
+    args = [x for x in a[1:] if not x.startswith("-")]
+    rec = any(x.startswith("-") and "r" in x.lower() for x in a[1:])
+    if len(args) < 2:
+        return err("copy: usage: copy [-r] source... destination")
+    dst, status = args[-1], 0
+    for src in args[:-1]:
+        try:
+            if os.path.isdir(src):
+                if not rec:
+                    status = err(f"copy: {src} est un dossier (utiliser -r)"); continue
+                target = os.path.join(dst, os.path.basename(src.rstrip("/"))) \
+                    if os.path.isdir(dst) else dst
+                shutil.copytree(src, target)
+            else:
+                shutil.copy(src, dst)
+        except OSError as e:
+            status = err(f"copy: {src}: {e.strerror or e}")
+    return status
+
+
+def b_move(a):
+    args = [x for x in a[1:] if not x.startswith("-")]
+    if len(args) < 2:
+        return err("move: usage: move source... destination")
+    status = 0
+    for src in args[:-1]:
+        try:
+            shutil.move(src, args[-1])
+        except (OSError, shutil.Error) as e:
+            status = err(f"move: {src}: {e}")
+    return status
+
+
+def b_del(a):
+    flags = "".join(x for x in a[1:] if x.startswith("-"))
+    files = [x for x in a[1:] if not x.startswith("-")]
+    if not files:
+        return err("del: usage: del [-r] [-f] fichier...")
+    status = 0
+    for f in files:
+        try:
+            if os.path.isdir(f) and not os.path.islink(f):
+                if "r" not in flags.lower():
+                    status = err(f"del: {f} est un dossier (utiliser -r)"); continue
+                shutil.rmtree(f)
+            else:
+                os.remove(f)
+        except OSError as e:
+            if "f" not in flags:
+                status = err(f"del: {f}: {e.strerror}")
+    return status
+
+
+def b_newdir(a):
+    parents = "-p" in a
+    dirs = [x for x in a[1:] if x != "-p"]
+    if not dirs:
+        return err("newdir: usage: newdir [-p] dossier...")
+    status = 0
+    for d in dirs:
+        try:
+            os.makedirs(d, exist_ok=parents) if parents else os.mkdir(d)
+        except OSError as e:
+            status = err(f"newdir: {d}: {e.strerror}")
+    return status
+
+
+def b_newfile(a):
+    if len(a) < 2:
+        return err("newfile: usage: newfile fichier...")
+    status = 0
+    for f in a[1:]:
+        try:
+            with open(f, "a"):
+                os.utime(f, None)
+        except OSError as e:
+            status = err(f"newfile: {f}: {e.strerror}")
+    return status
+
+
+def b_past(a):
+    if readline:
+        for i in range(1, readline.get_current_history_length() + 1):
+            print(f"{i:4}  {readline.get_history_item(i)}")
+    return 0
+
+
+def b_osinfo(a):
+    print("Systèmes d’Exploitation –- UIR/ESIN"); return 0
+
+
+def b_export(a):
+    for arg in a[1:]:
+        name, eq, val = arg.partition("=")
+        if eq:
+            shvars[name] = val
+        os.environ[name] = shvars.get(name, os.environ.get(name, ""))
+    return 0
+
+
+def b_unset(a):
+    for name in a[1:]:
+        shvars.pop(name, None); os.environ.pop(name, None)
+    return 0
+
+
+def b_jobs(a):
+    for pid, cmd in bg_jobs.items():
+        print(f"[{pid}] En cours  {cmd}")
+    return 0
+
+
+def b_test(a):
+    """test EXPR : -f -d -e -z -n, =, !=, -eq -ne -lt -le -gt -ge, négation !"""
+    args = a[1:]
+    if args and args[-1] == "]":
+        args = args[:-1]
+    neg = bool(args and args[0] == "!")
+    if neg:
+        args = args[1:]
+    try:
+        if len(args) == 1:
+            r = args[0] != ""
+        elif len(args) == 2:
+            op, x = args
+            r = {"-f": os.path.isfile, "-d": os.path.isdir, "-e": os.path.exists,
+                 "-z": lambda s: s == "", "-n": lambda s: s != ""}[op](x)
+        elif len(args) == 3:
+            x, op, y = args
+            if op == "=":
+                r = x == y
+            elif op == "!=":
+                r = x != y
+            else:
+                x, y = int(x), int(y)
+                r = {"-eq": x == y, "-ne": x != y, "-lt": x < y,
+                     "-le": x <= y, "-gt": x > y, "-ge": x >= y}[op]
+        else:
+            return 2
+    except (KeyError, ValueError):
+        return 2
+    return 0 if r != neg else 1
+
+
+HELP = """opsh — builtins disponibles :
+  go [dir]        (cd)     changer de répertoire
+  list [-a] [-l]  (ls)     lister un répertoire
+  show [fichier]  (cat)    afficher un fichier (ou stdin)
+  path            (pwd)    répertoire courant
+  say [-n] txt    (echo)   afficher du texte
+  copy [-r] s d   (cp)     copier        move s d  (mv)  déplacer
+  del [-r] f      (rm)     supprimer     newdir d  (mkdir)  newfile f (touch)
+  past            (history) historique   info (help)  cette aide
+  quit [code]     (exit)   quitter       osinfo       infos du cours
+  export N=V / unset N / test EXPR / jobs
+Syntaxe : cmd1 -> cmd2 (pipe), > >> < (redirections), & (arrière-plan),
+          $VAR ${VAR} $? $! $(cmd) `cmd`, VAR=valeur"""
+
+
+def b_info(a):
+    print(HELP); return 0
+
+
+BUILTINS = {
+    "go": b_go, "quit": b_quit, "path": b_path, "say": b_say, "list": b_list,
+    "show": b_show, "copy": b_copy, "move": b_move, "del": b_del,
+    "newdir": b_newdir, "newfile": b_newfile, "past": b_past, "info": b_info,
+    "osinfo": b_osinfo, "export": b_export, "unset": b_unset, "jobs": b_jobs,
+    "test": b_test, "[": b_test,
+}
+
+
+def run_builtin(argv):
+    try:
+        return BUILTINS[argv[0]](argv) or 0
+    except BrokenPipeError:
+        return 0
+    except OSError as e:
+        return err(f"{argv[0]}: {e.strerror or e}")
+
+
+# --------------------------------------------------------------------------
+# Exécution : fork / dup2 / exec / wait
+# --------------------------------------------------------------------------
+def apply_redirs(redirs):
+    """Redirige les descripteurs 0 et 1 avec dup2 (fd 0=stdin, 1=stdout)."""
+    for op, fname in redirs:
+        if op == "<":
+            fd, target = os.open(fname, os.O_RDONLY), 0
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if op == ">>" else os.O_TRUNC)
+            fd, target = os.open(fname, flags, 0o644), 1
+        os.dup2(fd, target)
+        os.close(fd)
+
+
+def child_main(argv, redirs):
+    """Code du processus fils : ne retourne jamais."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)   # le fils doit être interruptible
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    try:
+        apply_redirs(redirs)
+        if argv[0] in BUILTINS:
+            try:
+                st = run_builtin(argv)
+            except SystemExit as e:
+                st = e.code if isinstance(e.code, int) else 0
+            sys.stdout.flush()
+            os._exit(st & 0xFF)
+        os.execvp(argv[0], argv)                    # remplace l'image du processus
+    except FileNotFoundError as e:
+        name = e.filename or argv[0]
+        print(f"opsh: {argv[0]}: commande introuvable" if name == argv[0]
+              else f"opsh: {name}: fichier introuvable", file=sys.stderr)
+        os._exit(127)
+    except OSError as e:
+        print(f"opsh: {argv[0]}: {e.strerror}", file=sys.stderr)
+        os._exit(126)
+
+
+def run_builtin_inprocess(argv, redirs):
+    """Builtin seul, sans pipe : exécuté dans le shell lui-même (go/export...)."""
+    saved = [os.dup(i) for i in (0, 1, 2)]
+    try:
+        apply_redirs(redirs)
+        return run_builtin(argv)
+    except OSError as e:
+        return err(f"{e.filename}: {e.strerror}")
+    finally:
+        sys.stdout.flush()
+        for i, s in enumerate(saved):
+            os.dup2(s, i); os.close(s)
+
+
+def status_of(st):
+    if os.WIFSIGNALED(st):
+        return 128 + os.WTERMSIG(st)
+    return os.WEXITSTATUS(st)
+
+
+def execute(cmds, bg, line):
+    if len(cmds) == 1 and not bg and cmds[0][0][0] in BUILTINS:
+        return run_builtin_inprocess(*cmds[0])
+
+    sys.stdout.flush()
+    old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C ne tue pas le shell
+    pids, prev, pgid = [], None, 0
+    try:
+        for idx, (argv, redirs) in enumerate(cmds):
+            r = w = None
+            if idx < len(cmds) - 1:
+                r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                if bg:
+                    os.setpgid(0, pgid)              # groupe séparé : pas de SIGINT clavier
+                if prev is not None:
+                    os.dup2(prev, 0); os.close(prev)
+                if w is not None:
+                    os.dup2(w, 1); os.close(w); os.close(r)
+                child_main(argv, redirs)
+            if bg:
+                pgid = pgid or pid
+                try:
+                    os.setpgid(pid, pgid)
+                except OSError:
+                    pass
+            if prev is not None:
+                os.close(prev)                       # le père ferme ses copies des pipes
+            if w is not None:
+                os.close(w)
+            prev = r
+            pids.append(pid)
+    finally:
+        if bg:
+            signal.signal(signal.SIGINT, old_int)
+
+    global last_bg
+    if bg:
+        last_bg = str(pids[-1])
+        for p in pids:
+            bg_jobs[p] = line
+        print(f"[{pids[-1]}] lancé en arrière-plan")
+        return 0
+
+    status = 0
+    try:
+        for p in pids:
+            _, st = os.waitpid(p, 0)
+            status = status_of(st)
+            if os.WIFSIGNALED(st) and os.WTERMSIG(st) == signal.SIGINT:
+                print()
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+    return status
+
+
+def execute_line(line):
+    """Exécute une ligne ; met à jour et renvoie $?."""
+    global last_status
+    try:
+        toks = tokenize(line)
+        if not toks:
+            return last_status
+        if len(toks) == 1 and toks[0][0] == "word" and ASSIGN.match(toks[0][1]):
+            name, _, val = toks[0][1].partition("=")
+            set_var(name, val)
+            last_status = 0
+            return 0
+        cmds, bg = parse(toks)
+        last_status = execute(cmds, bg, line)
+    except SyntaxError as e:
+        print(f"opsh: erreur de syntaxe : {e}", file=sys.stderr)
+        last_status = 2
+    except OSError as e:
+        print(f"opsh: {e}", file=sys.stderr)
+        last_status = 1
+    return last_status
+
+
+# --------------------------------------------------------------------------
+# Signaux : SIGCHLD récolte les processus d'arrière-plan (évite les zombies)
+# --------------------------------------------------------------------------
+def on_sigchld(signum, frame):
+    for pid in list(bg_jobs):
+        try:
+            p, st = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            bg_jobs.pop(pid, None)
+            continue
+        if p:
+            cmd = bg_jobs.pop(pid)
+            print(f"\n[{pid}] terminé (statut {status_of(st)})  {cmd}")
+
+
+# --------------------------------------------------------------------------
+# Mode script : if / for / while
+# --------------------------------------------------------------------------
+def _clean(line, kw):
+    rest = line[len(kw):].strip()
+    for suf in ("; then", "; do"):
+        if rest.endswith(suf):
+            rest = rest[:-len(suf)].strip()
+    return rest
+
+
+def parse_block(lines, i, terms):
+    nodes = []
+    while i < len(lines):
+        l = lines[i].strip()
+        if not l or l.startswith("#"):
+            i += 1; continue
+        w = l.split()[0]
+        if w in terms:
+            return nodes, i, w
+        if w in ("then", "do"):
+            i += 1; continue
+        if w in ("fi", "done", "else"):
+            raise SyntaxError(f"« {w} » inattendu")
+        if w == "if":
+            cond = _clean(l, "if")
+            body, i, t = parse_block(lines, i + 1, ("else", "fi"))
+            orelse = []
+            if t == "else":
+                orelse, i, t = parse_block(lines, i + 1, ("fi",))
+            nodes.append(("if", cond, body, orelse)); i += 1
+        elif w == "for":
+            m = re.match(r"for\s+(\w+)\s+in\s*(.*?)(;\s*do)?$", l)
+            if not m:
+                raise SyntaxError("for: syntaxe « for VAR in a b c »")
+            body, i, _ = parse_block(lines, i + 1, ("done",))
+            nodes.append(("for", m.group(1), m.group(2), body)); i += 1
+        elif w == "while":
+            cond = _clean(l, "while")
+            body, i, _ = parse_block(lines, i + 1, ("done",))
+            nodes.append(("while", cond, body)); i += 1
+        else:
+            nodes.append(("cmd", l)); i += 1
+    if terms:
+        raise SyntaxError(f"bloc non fermé (« {terms[-1]} » attendu)")
+    return nodes, i, None
+
+
+def exec_nodes(nodes):
+    for n in nodes:
+        if n[0] == "cmd":
+            execute_line(n[1])
+        elif n[0] == "if":
+            exec_nodes(n[2] if execute_line(n[1]) == 0 else n[3])
+        elif n[0] == "while":
+            while execute_line(n[1]) == 0:
+                exec_nodes(n[2])
+        elif n[0] == "for":
+            items = [v for k, v in tokenize(n[2]) if k == "word"]
+            for it in items:
+                set_var(n[1], it)
+                exec_nodes(n[3])
+
+
+def run_lines(lines):
+    nodes, _, _ = parse_block(lines, 0, ())
+    exec_nodes(nodes)
+
+
+def run_script(path, args):
+    shvars["0"] = path
+    for k, v in enumerate(args, 1):
+        shvars[str(k)] = v
+    try:
+        with open(path) as fh:
+            run_lines(fh.read().splitlines())
+    except OSError as e:
+        return err(f"{path}: {e.strerror}")
+    except SyntaxError as e:
+        print(f"opsh: {path}: erreur de syntaxe : {e}", file=sys.stderr)
+        return 2
+    return last_status
+
+
+# --------------------------------------------------------------------------
+# Complétion + REPL
+# --------------------------------------------------------------------------
+def path_executables():
+    out = set()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            for f in os.listdir(d):
+                if os.access(os.path.join(d, f), os.X_OK):
+                    out.add(f)
+        except OSError:
+            pass
+    return out
+
+
+_exe_cache = None
+
+
+def completer(text, state):
+    global _exe_cache
+    buf = readline.get_line_buffer()[:readline.get_begidx()].rstrip()
+    matches = []
+    if buf == "" or buf.endswith("->"):
+        if _exe_cache is None:
+            _exe_cache = path_executables()
+        matches += [c for c in sorted(set(BUILTINS) | _exe_cache) if c.startswith(text)]
+    for f in sorted(glob.glob(os.path.expanduser(text) + "*")):
+        matches.append(f + "/" if os.path.isdir(f) else f)
+    return matches[state] if state < len(matches) else None
+
+
+def setup_readline():
+    if not readline:
+        return
+    try:
+        readline.read_history_file(HISTFILE)
+    except OSError:
+        pass
+    readline.set_completer_delims(" \t\n")
+    readline.set_completer(completer)
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+
+
+def load_rc():
+    rc = os.path.expanduser("~/.opshrc")
+    if os.path.isfile(rc):
+        with open(rc) as fh:
+            for l in fh:
+                if l.strip() and not l.lstrip().startswith("#"):
+                    execute_line(l.rstrip("\n"))
+
+
+def repl():
+    setup_readline()
+    load_rc()
+    try:
+        while True:
+            try:
+                line = input("opsh> ")
+            except EOFError:
+                print(); break
+            except KeyboardInterrupt:
+                print(); continue
+            if line.strip():
+                execute_line(line)
+    except SystemExit:
+        pass
+    finally:
+        if readline:
+            try:
+                readline.write_history_file(HISTFILE)
+            except OSError:
+                pass
+
+
+def main():
+    signal.signal(signal.SIGCHLD, on_sigchld)
+    if len(sys.argv) > 1:
+        sys.exit(run_script(sys.argv[1], sys.argv[2:]))
+    repl()
+    sys.exit(last_status)
+
+
+if __name__ == "__main__":
+    main()
